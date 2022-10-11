@@ -9,6 +9,7 @@
 Все модели изображений, опубликованные в [TensorFlow Hub](https://tfhub.dev/s?deployment-format=lite) , были заполнены метаданными.
 
 ## Модель с форматом метаданных
+## ffff Модель с форматом метаданных
 
 <center><img src="../../images/convert/model_with_metadata.png" alt="model_with_metadata" width="70%"></center>
 <center>Рис. 1. Модель TFLite с метаданными и соответствующими файлами.</center>
