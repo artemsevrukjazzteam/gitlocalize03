@@ -1,382 +1,193 @@
-# 将元数据添加到 TensorFlow Lite 模型
+# TensorFlow Data Validation：检查和分析数据
 
-TensorFlow Lite 元数据为模型描述提供了标准。元数据是有关模型功能及其输入/输出信息的重要知识来源。元数据由两者组成
+一旦数据输入到 TFX 流水线，就可以使用 TFX 组件进行分析和转换。您甚至可以在训练模型之前使用这些工具。
 
-- 传达使用模型时的最佳实践的人类可读部分，以及
-- 代码生成器可以利用的机器可读部分，例如[TensorFlow Lite Android 代码生成器](../../inference_with_metadata/codegen#generate-code-with-tensorflow-lite-android-code-generator)和[Android Studio ML 绑定功能](../../inference_with_metadata/codegen#generate-code-with-android-studio-ml-model-binding)。
+分析和转换数据的原因很多：
 
-在[TensorFlow Hub](https://tfhub.dev/s?deployment-format=lite)上发布的所有图像模型都已填充元数据。
+- 在数据中查找问题。常见问题包括：
+    - 缺失数据，例如具有空值的特征。
+    - 标签被视为特征，以至您的模型在训练期间窥探到正确答案。
+    - 值超出预期范围的特征。
+    - 数据异常。
+    - 迁移学习模型的预处理与训练数据不匹配。
+- 设计更高效的特征集。例如，您可以识别：
+    - 信息量特别大的特征。
+    - 冗余特征。
+    - 尺度上差异较大，以至可能减慢学习速度的特征。
+    - 具有很少或没有独特预测性信息的特征。
 
-## 具有元数据格式的模型
+TFX 工具既可以帮助发现数据错误，又可以帮助进行特征工程。
 
-<center><img src="../../images/convert/model_with_metadata.png" alt="model_with_metadata" width="70%"></center>
-<center>图 1. 带有元数据和关联文件的 TFLite 模型。</center>
+## TensorFlow Data Validation
 
-模型元数据在[metadata_schema.fbs](https://github.com/tensorflow/tflite-support/blob/master/tensorflow_lite_support/metadata/metadata_schema.fbs)中定义，这是一个[FlatBuffer](https://google.github.io/flatbuffers/index.html#flatbuffers_overview)文件。如图 1 所示，它存储在[TFLite 模型模式](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/lite/schema/schema.fbs)的[元数据](https://github.com/tensorflow/tensorflow/blob/bd73701871af75539dd2f6d7fdba5660a8298caf/tensorflow/lite/schema/schema.fbs#L1208)字段中，名称为`"TFLITE_METADATA"` 。一些模型可能带有相关文件，例如[分类标签文件](https://github.com/tensorflow/examples/blob/dd98bc2b595157c03ac9fa47ac8659bb20aa8bbd/lite/examples/image_classification/android/models/src/main/assets/labels.txt#L1)。使用 ZipFile [“附加”模式](https://pymotw.com/2/zipfile/#appending-to-files)（ `'a'`模式）将这些文件作为 ZIP 连接到原始模型文件的末尾。 TFLite Interpreter 可以像以前一样使用新文件格式。有关详细信息，请参阅[打包关联文件](#pack-the-associated-files)。
+- [概述](#overview)
+- [基于架构的样本验证](#schema_based_example_validation)
+- [训练-应用偏差检测](#skewdetect)
+- [漂移检测](#drift_detection)
 
-请参阅下面有关如何填充、可视化和读取元数据的说明。
-
-## 设置元数据工具
+### 概述
 
-在将元数据添加到模型之前，您需要设置 Python 编程环境来运行 TensorFlow。[这里](https://www.tensorflow.org/install)有关于如何设置的详细指南。
-
-设置 Python 编程环境后，您将需要安装额外的工具：
+TensorFlow Data Validation 可识别训练数据和应用数据中的异常，并且可以通过检查数据自动创建架构。可以将组件配置为检测数据中不同类别的异常。它可以：
 
-```sh
-pip install tflite-support
-```
+1. 通过将数据统计信息与对用户预期进行编码的架构加以比较来执行有效性检查。
+2. 通过比较训练数据和应用数据中的样本来检测训练-应用偏差。
+3. 通过查看一系列数据来检测数据漂移。
 
-TensorFlow Lite 元数据工具支持 Python 3。
+我们独立记录以下每个功能：
 
-## 使用 Flatbuffers Python API 添加元数据
+- [基于架构的样本验证](#schema_based_example_validation)
+- [训练-应用偏差检测](#skewdetect)
+- [漂移检测](#drift_detection)
 
-注意：要为[TensorFlow Lite Task Library](../../inference_with_metadata/task_library/overview)中支持的流行 ML 任务创建元数据，请使用[TensorFlow Lite Metadata Writer Library](metadata_writer_tutorial.ipynb)中的高级 API。
+### 基于架构的样本验证
 
-[模式](https://github.com/tensorflow/tflite-support/blob/master/tensorflow_lite_support/metadata/metadata_schema.fbs)中的模型元数据分为三个部分：
+TensorFlow Data Validation 通过将数据统计信息与架构进行比较来识别输入数据中的任何异常。架构会对输入数据预期满足的属性（例如数据类型或分类值）进行编码，并且可由用户修改或替换。
 
-1. **模型信息**- 模型的总体描述以及许可条款等项目。请参阅[模型元数据](https://github.com/tensorflow/tflite-support/blob/4cd0551658b6e26030e0ba7fc4d3127152e0d4ae/tensorflow_lite_support/metadata/metadata_schema.fbs#L640)。
-2. **输入信息**- 输入的描述和所需的预处理，例如规范化。请参阅[SubGraphMetadata.input_tensor_metadata](https://github.com/tensorflow/tflite-support/blob/4cd0551658b6e26030e0ba7fc4d3127152e0d4ae/tensorflow_lite_support/metadata/metadata_schema.fbs#L590) 。
-3. **输出信息**- 输出和所需后处理的描述，例如映射到标签。请参阅[SubGraphMetadata.output_tensor_metadata](https://github.com/tensorflow/tflite-support/blob/4cd0551658b6e26030e0ba7fc4d3127152e0d4ae/tensorflow_lite_support/metadata/metadata_schema.fbs#L599) 。
+Tensorflow Data Validation 通常会在 TFX 流水线的上下文中多次调用：(i) 对于从 ExampleGen 获得的每个拆分，(ii) 对于 Transform 使用的所有预转换数据，以及 (iii) 对于 Transform 生成的所有转换后数据。在 Transform (ii-iii) 的上下文中调用时，可以通过定义 [`stats_options_updater_fn`](tft.md) 来设置统计选项和基于架构的约束。这在验证非结构化数据（例如文本特征）时特别有用。有关示例，请参阅[用户代码](https://github.com/tensorflow/tfx/blob/master/tfx/examples/bert/mrpc/bert_mrpc_utils.py)。
 
-由于此时 TensorFlow Lite 仅支持单个子图，因此在显示元数据和生成代码时， [TensorFlow Lite 代码生成器](../../inference_with_metadata/codegen#generate-code-with-tensorflow-lite-android-code-generator)和[Android Studio ML 绑定功能](../../inference_with_metadata/codegen#generate-code-with-android-studio-ml-model-binding)将使用`ModelMetadata.name`和`ModelMetadata.description` ，而不是`SubGraphMetadata.name`和`SubGraphMetadata.description` 。
+#### 高级架构特征
 
-### 支持的输入/输出类型
+本部分介绍可以帮助完成特殊设置的更高级架构配置。
 
-输入和输出的 TensorFlow Lite 元数据在设计时并未考虑特定的模型类型，而是输入和输出类型。不管模型的功能是什么，只要输入和输出类型包含以下内容或以下内容的组合，TensorFlow Lite 元数据就支持它：
+##### 稀疏特征
 
-- 特征 - 无符号整数或 float32 的数字。
-- 图像 - 元数据目前支持 RGB 和灰度图像。
-- 边界框 - 矩形边界框。该架构支持[多种编号方案](https://github.com/tensorflow/tflite-support/blob/4cd0551658b6e26030e0ba7fc4d3127152e0d4ae/tensorflow_lite_support/metadata/metadata_schema.fbs#L214)。
+在样本中对稀疏特征进行编码通常会引入多个特征，这些特征预期对于所有样本都具有相同的价。例如稀疏特征：
 
-### 打包相关文件
+<pre><code>
+WeightedCategories = [('CategoryA', 0.3), ('CategoryX', 0.7)]
+</code></pre>
 
-TensorFlow Lite 模型可能带有不同的关联文件。例如，自然语言模型通常有将单词片段映射到单词 ID 的 vocab 文件；分类模型可能具有指示对象类别的标签文件。如果没有关联文件（如果有），模型将无法正常运行。
+将使用单独的索引和值特征进行编码：
 
-现在可以通过元数据 Python 库将关联文件与模型捆绑在一起。新的 TensorFlow Lite 模型成为一个包含模型和关联文件的 zip 文件。可以用常用的zip工具解压。这种新的模型格式继续使用相同的文件扩展名`.tflite` 。它与现有的 TFLite 框架和解释器兼容。有关详细信息，请参阅[将元数据和关联文件打包到模型](#pack-metadata-and-associated-files-into-the-model)中。
+<pre><code>
+WeightedCategoriesIndex = ['CategoryA', 'CategoryX']
+WeightedCategoriesValue = [0.3, 0.7]
+</code></pre>
 
-关联的文件信息可以记录在元数据中。根据文件类型和文件附加到的位置（即`ModelMetadata` 、 `SubGraphMetadata`和`TensorMetadata` ）， [TensorFlow Lite Android 代码生成器](../../inference_with_metadata/codegen)可能会自动对对象应用相应的预处理/后处理。有关更多详细信息，请参阅架构[中每个关联文件类型的 &lt;Codegen usage&gt; 部分](https://github.com/tensorflow/tflite-support/blob/4cd0551658b6e26030e0ba7fc4d3127152e0d4ae/tensorflow_lite_support/metadata/metadata_schema.fbs#L77-L127)。
+同时存在以下限制：所有样本的索引和值特征的价应当匹配。通过定义 sparse_feature，可以在架构中使这种限制显性化：
 
-### 归一化和量化参数
-
-归一化是机器学习中常见的数据预处理技术。规范化的目标是将值更改为通用尺度，而不扭曲值范围内的差异。
-
-[模型量化](https://www.tensorflow.org/lite/performance/model_optimization#model_quantization)是一种允许降低权重表示精度的技术，并且可以选择用于存储和计算的激活。
-
-就预处理和后处理而言，归一化和量化是两个独立的步骤。这是详细信息。
-
- | 正常化 | 量化
-:-: | --- | ---
-\ | **浮动模型**：\ | **浮动模型**：\
-: 一个例子: - 均值: 127.5 \ : - zeroPoint: 0 \ : |  |
-: 的参数值: - std: 127.5 \ : - scale: 1.0 \ : |  |
-: input image in :**量化模型**: \ :**量化模型**: \ : |  |
-: MobileNet for float and : - mean: 127.5 \ : - zeroPoint: 128.0 \ : |  |
-：量化模型，：-标准：127.5：-比例：0.0078125f \： |  |
-： 分别。 : : : |  |
-\ | \ | **浮动模型**确实
-: \ : \ : 不需要量化。 \ : |  |
-：\：**输入**：如果输入：**量化模型**可能： |  |
-: \ : 数据标准化为 : 或可能不需要 : |  |
-: 什么时候调用？ ：训练，输入：前/后量化： |  |
-: : 推理需要的数据 : 处理。这取决于 ： |  |
-: : 规范化 : 在数据类型上 : |  |
-： ： 因此。 \ ：输入/输出张量。 \ : |  |
-：：**输出**：输出：-浮点张量：否： |  |
-: : 数据不会是 : 前/后量化 : |  |
-: : 一般归一化。 : 需要处理。数量： |  |
-: : : op 和 dequant op 是： |  |
-: : : 烘焙到模型中： |  |
-: : : 图。 \ : |  |
-: : : - int8/uint8 张量: : |  |
-: : : 需要量化： |  |
-: : : 前/后处理。 : |  |
-\ | \ | **量化输入**：
-: \ : \ : \ : |  |
-: 公式 : normalized_input = : q = f / scale + : |  |
-: : (输入 - 平均值) / std : zeroPoint \ : |  |
-: : : **反量化： |  |
-：：：输出**：\： |  |
-: : : f = (q - zeroPoint) * : |  |
-： ： ： 规模 ： |  |
-\ | 由模型创建者填写 | 自动填写
-: : 和存储在模型 : TFLite 转换器中的位置，以及 : |  |
-：参数：元数据，如：存储在 tflite 模型中： |  |
-：： `NormalizationOptions`选项：文件。 : |  |
-如何获得 | 通过 | 通过 TFLite
-： 参数？ : `MetadataExtractor` API : `Tensor` API [1] 或 : |  |
-: : [2] : 通过 : |  |
-`MetadataExtractor` API： |  |
-: : : [2] : |  |
-做浮动和量化 | 是的，浮动和量化 | 不，浮动模型确实如此
-: models share the same : models have the same : 不需要量化。 : |  |
-： 价值？ ：归一化：： |  |
-： ： 参数 ： ： |  |
-TFLite 代码 | \ | \
-: 发电机或 Android : 是 : 是 : |  |
-: Studio ML 绑定 : : : |  |
-: 自动生成 : : : |  |
-: 它在数据处理？ : : : |  |
-
-[1] [TensorFlow Lite Java API](https://github.com/tensorflow/tensorflow/blob/09ec15539eece57b257ce9074918282d88523d56/tensorflow/lite/java/src/main/java/org/tensorflow/lite/Tensor.java#L73)和[TensorFlow Lite C++ API](https://github.com/tensorflow/tensorflow/blob/09ec15539eece57b257ce9074918282d88523d56/tensorflow/lite/c/common.h#L391) 。
- [2][元数据提取器库](#read-the-metadata-from-models)
-
-处理 uint8 模型的图像数据时，有时会跳过归一化和量化。当像素值在 [0, 255] 范围内时这样做是可以的。但一般来说，您应该始终根据适用的归一化和量化参数来处理数据。
-
-如果您在元数据中设置`NormalizationOptions` ， [TensorFlow Lite Task Library](https://www.tensorflow.org/lite/inference_with_metadata/overview)可以为您处理规范化。量化和反量化处理始终是封装的。
-
-### 例子
-
-注意：指定的导出目录必须在运行脚本之前存在；它不会作为流程的一部分创建。
-
-您可以在此处找到有关如何为不同类型的模型填充元数据的示例：
-
-#### 图片分类
-
-在[此处](https://github.com/tensorflow/examples/tree/master/lite/examples/image_classification/metadata/metadata_writer_for_image_classifier.py)下载脚本，它将元数据填充到[mobilenet_v1_0.75_160_quantized.tflite](https://tfhub.dev/tensorflow/lite-model/mobilenet_v1_0.75_160_quantized/1/default/1) 。像这样运行脚本：
-
-```sh
-python ./metadata_writer_for_image_classifier.py \
-    --model_file=./model_without_metadata/mobilenet_v1_0.75_160_quantized.tflite \
-    --label_file=./model_without_metadata/labels.txt \
-    --export_directory=model_with_metadata
-```
-
-要为其他图像分类模型填充元数据，请将模型规范添加[到](https://github.com/tensorflow/examples/blob/master/lite/examples/image_classification/metadata/metadata_writer_for_image_classifier.py#L63-L74)脚本中。本指南的其余部分将突出显示图像分类示例中的一些关键部分，以说明关键元素。
-
-### 深入研究图像分类示例
-
-#### 型号信息
-
-元数据首先创建一个新的模型信息：
-
-```python
-from tflite_support import flatbuffers
-from tflite_support import metadata as _metadata
-from tflite_support import metadata_schema_py_generated as _metadata_fb
-
-""" ... """
-"""Creates the metadata for an image classifier."""
-
-# Creates model info.
-
-model_meta = _metadata_fb.ModelMetadataT()
-model_meta.name = "MobileNetV1 image classifier"
-model_meta.description = ("Identify the most prominent object in the "
-                          "image from a set of 1,001 categories such as "
-                          "trees, animals, food, vehicles, person etc.")
-model_meta.version = "v1"
-model_meta.author = "TensorFlow"
-model_meta.license = ("Apache License. Version 2.0 "
-                      "http://www.apache.org/licenses/LICENSE-2.0.")
-```
-
-#### 输入/输出信息
-
-本节向您展示如何描述模型的输入和输出签名。自动代码生成器可以使用此元数据来创建预处理和后处理代码。要创建有关张量的输入或输出信息：
-
-```python
-# Creates input info.
-
-input_meta = _metadata_fb.TensorMetadataT()
-
-# Creates output info.
-
-output_meta = _metadata_fb.TensorMetadataT()
-```
-
-#### 图片输入
-
-图像是机器学习的常见输入类型。 TensorFlow Lite 元数据支持颜色空间等信息和归一化等预处理信息。图像的维度不需要手动指定，因为它已经由输入张量的形状提供并且可以自动推断。
-
-```python
-input_meta.name = "image"
-input_meta.description = (
-    "Input image to be classified. The expected image is {0} x {1}, with "
-    "three channels (red, blue, and green) per pixel. Each value in the "
-    "tensor is a single byte between 0 and 255.".format(160, 160))
-input_meta.content = _metadata_fb.ContentT()
-input_meta.content.contentProperties = _metadata_fb.ImagePropertiesT()
-input_meta.content.contentProperties.colorSpace = (
-    _metadata_fb.ColorSpaceType.RGB)
-input_meta.content.contentPropertiesType = (
-    _metadata_fb.ContentProperties.ImageProperties)
-input_normalization = _metadata_fb.ProcessUnitT()
-input_normalization.optionsType = (
-    _metadata_fb.ProcessUnitOptions.NormalizationOptions)
-input_normalization.options = _metadata_fb.NormalizationOptionsT()
-input_normalization.options.mean = [127.5]
-input_normalization.options.std = [127.5]
-input_meta.processUnits = [input_normalization]
-input_stats = _metadata_fb.StatsT()
-input_stats.max = [255]
-input_stats.min = [0]
-input_meta.stats = input_stats
-```
-
-#### 标签输出
-
-可以使用`TENSOR_AXIS_LABELS`通过关联文件将标签映射到输出张量。
-
-```python
-# Creates output info.
-
-output_meta = _metadata_fb.TensorMetadataT()
-output_meta.name = "probability"
-output_meta.description = "Probabilities of the 1001 labels respectively."
-output_meta.content = _metadata_fb.ContentT()
-output_meta.content.content_properties = _metadata_fb.FeaturePropertiesT()
-output_meta.content.contentPropertiesType = (
-    _metadata_fb.ContentProperties.FeatureProperties)
-output_stats = _metadata_fb.StatsT()
-output_stats.max = [1.0]
-output_stats.min = [0.0]
-output_meta.stats = output_stats
-label_file = _metadata_fb.AssociatedFileT()
-label_file.name = os.path.basename("your_path_to_label_file")
-label_file.description = "Labels for objects that the model can recognize."
-label_file.type = _metadata_fb.AssociatedFileType.TENSOR_AXIS_LABELS
-output_meta.associatedFiles = [label_file]
-```
-
-#### 创建元数据 Flatbuffers
-
-以下代码将模型信息与输入和输出信息组合在一起：
-
-```python
-# Creates subgraph info.
-
-subgraph = _metadata_fb.SubGraphMetadataT()
-subgraph.inputTensorMetadata = [input_meta]
-subgraph.outputTensorMetadata = [output_meta]
-model_meta.subgraphMetadata = [subgraph]
-
-b = flatbuffers.Builder(0)
-b.Finish(
-    model_meta.Pack(b),
-    _metadata.MetadataPopulator.METADATA_FILE_IDENTIFIER)
-metadata_buf = b.Output()
-```
-
-#### 将元数据和相关文件打包到模型中
-
-创建元数据 Flatbuffers 后，元数据和标签文件将通过`populate`方法写入 TFLite 文件：
-
-```python
-populator = _metadata.MetadataPopulator.with_model_file(model_file)
-populator.load_metadata_buffer(metadata_buf)
-populator.load_associated_files(["your_path_to_label_file"])
-populator.populate()
-```
-
-您可以通过`load_associated_files`将任意数量的关联文件打包到模型中。但是，至少需要打包元数据中记录的那些文件。在这个例子中，打包标签文件是强制性的。
-
-## 可视化元数据
-
-您可以使用[Netron](https://github.com/lutzroeder/netron)可视化您的元数据，或者您可以使用`MetadataDisplayer`将 TensorFlow Lite 模型中的元数据读取为 json 格式：
-
-```python
-displayer = _metadata.MetadataDisplayer.with_model_file(export_model_path)
-export_json_file = os.path.join(FLAGS.export_directory,
-                    os.path.splitext(model_basename)[0] + ".json")
-json_file = displayer.get_metadata_json()
-# Optional: write out the metadata as a json file
-
-with open(export_json_file, "w") as f:
-  f.write(json_file)
-```
-
-Android Studio 还支持通过[Android Studio ML Binding 功能](https://developer.android.com/studio/preview/features#tensor-flow-lite-models)显示元数据。
-
-## 元数据版本控制
-
-[元数据模式](https://github.com/tensorflow/tflite-support/blob/master/tensorflow_lite_support/metadata/metadata_schema.fbs)由跟踪模式文件更改的语义版本号和指示真实版本兼容性的 Flatbuffers 文件标识进行版本控制。
-
-### 语义版本号
-
-元数据模式由[语义版本号控制](https://github.com/tensorflow/tflite-support/blob/4cd0551658b6e26030e0ba7fc4d3127152e0d4ae/tensorflow_lite_support/metadata/metadata_schema.fbs#L53)，例如 MAJOR.MINOR.PATCH。它根据[此处](https://github.com/tensorflow/tflite-support/blob/4cd0551658b6e26030e0ba7fc4d3127152e0d4ae/tensorflow_lite_support/metadata/metadata_schema.fbs#L32-L44)的规则跟踪架构更改。查看版本`1.0.0`之后添加[的字段的历史记录](https://github.com/tensorflow/tflite-support/blob/4cd0551658b6e26030e0ba7fc4d3127152e0d4ae/tensorflow_lite_support/metadata/metadata_schema.fbs#L63)。
-
-### Flatbuffers文件识别
-
-语义版本控制在遵循规则的情况下保证兼容性，但并不意味着真正的不兼容。当增加 MAJOR 编号时，并不一定意味着向后兼容性被破坏。因此，我们使用[Flatbuffers 文件标识](https://google.github.io/flatbuffers/md__schemas.html)[file_identifier](https://github.com/tensorflow/tflite-support/blob/4cd0551658b6e26030e0ba7fc4d3127152e0d4ae/tensorflow_lite_support/metadata/metadata_schema.fbs#L61)来表示元数据模式的真正兼容性。文件标识符正好是 4 个字符长。它固定在一定的元数据模式中，用户不得更改。如果由于某种原因必须破坏元数据模式的向后兼容性，则 file_identifier 将会增加，例如，从“M001”到“M002”。预计 File_identifier 的更改频率远低于 metadata_version。
-
-### 最低必需的元数据解析器版本
-
-[最低必需的元数据解析器版本](https://github.com/tensorflow/tflite-support/blob/4cd0551658b6e26030e0ba7fc4d3127152e0d4ae/tensorflow_lite_support/metadata/metadata_schema.fbs#L681)是可以完整读取元数据 Flatbuffers 的元数据解析器（Flatbuffers 生成的代码）的最低版本。该版本实际上是所有填充字段的版本中最大的版本号和文件标识符指示的最小兼容版本。当元数据填充到 TFLite 模型中时， `MetadataPopulator`会自动填充最低必需的元数据解析器版本。有关如何使用最低必要元数据解析器版本的更多信息，请参阅[元数据提取器](#read-the-metadata-from-models)。
-
-## 从模型中读取元数据
-
-Metadata Extractor 库是一种方便的工具，可以从不同平台的模型中读取元数据和相关文件（请参阅[Java 版本](https://github.com/tensorflow/tflite-support/tree/master/tensorflow_lite_support/metadata/java)和[C++ 版本](https://github.com/tensorflow/tflite-support/tree/master/tensorflow_lite_support/metadata/cc)）。您可以使用 Flatbuffers 库以其他语言构建自己的元数据提取器工具。
-
-### 读取 Java 中的元数据
-
-要在您的 Android 应用程序中使用元数据提取器库，我们建议使用[托管在 MavenCentral 的 TensorFlow Lite 元数据 AAR](https://search.maven.org/artifact/org.tensorflow/tensorflow-lite-metadata) 。它包含`MetadataExtractor`类，以及[元数据模式](https://github.com/tensorflow/tflite-support/blob/master/tensorflow_lite_support/metadata/metadata_schema.fbs)和[模型模式](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/lite/schema/schema.fbs)的 FlatBuffers Java 绑定。
-
-您可以在`build.gradle`依赖项中指定它，如下所示：
-
-```build
-dependencies {
-    implementation 'org.tensorflow:tensorflow-lite-metadata:0.1.0'
+<pre><code class="lang-proto">
+sparse_feature {
+  name: 'WeightedCategories'
+  index_feature { name: 'WeightedCategoriesIndex' }
+  value_feature { name: 'WeightedCategoriesValue' }
 }
+</code></pre>
+
+稀疏特征定义需要一个或多个索引和一个值特征，它们引用架构中存在的特征。显式定义稀疏特征使 TFDV 能够检查所有引用特征的价是否匹配。
+
+一些用例在特征之间引入了相似的价限制，但不一定对稀疏特征进行编码。使用稀疏特征应当可以解除对您的限制，但并不是理想的方法。
+
+##### 架构环境
+
+默认情况下，验证假定流水线中的所有样本都遵循单个架构。在某些情况下，有必要引入轻微的架构变化，例如，在训练过程中需要使用用作标签的特征（并且应予以验证），但这些特征会在应用过程中丢失。环境可用于表达此类要求，尤其是 `default_environment()`、`in_environment()` 和 `not_in_environment()`。
+
+例如，假设训练需要使用名为“LABEL”的特征，但预计该特征将在应用时丢失。这可以表示为：
+
+- 在架构中定义两个不同的环境：["SERVING", "TRAINING"] 并将“LABEL”仅与环境“TRAINING”关联。
+- 将训练数据与环境“TRAINING”关联，将应用数据与环境“SERVING”关联。
+
+##### 架构生成
+
+输入数据架构被指定为 TensorFlow [Schema](https://github.com/tensorflow/metadata/blob/master/tensorflow_metadata/proto/v0/schema.proto) 的实例。
+
+开发者可以依靠 TensorFlow Data Validation 的自动架构构造功能，而不必从头开始手动构造架构。具体来说，TensorFlow Data Validation 基于根据流水线中可用的训练数据计算的统计信息自动构造初始架构。用户只需查看此自动生成的架构，根据需要进行修改，将其纳入版本控制系统，然后将其显式推送到流水线中供进一步验证。
+
+TFDV 包含 `infer_schema()` 以自动生成架构。例如：
+
+```python
+schema = tfdv.infer_schema(statistics=train_stats)
+tfdv.display_schema(schema=schema)
 ```
 
-要使用夜间快照，请确保您已添加[Sonatype 快照存储库](https://www.tensorflow.org/lite/android/lite_build#use_nightly_snapshots)。
+这将根据以下规则触发自动架构生成：
 
-您可以使用指向模型的`ByteBuffer`初始化`MetadataExtractor`对象：
+- 如果已经自动生成架构，则按原样使用它。
 
-```java
-public MetadataExtractor(ByteBuffer buffer);
-```
+- 否则，TensorFlow Data Validation 会检查可用的数据统计信息并为该数据计算合适的架构。
 
-`ByteBuffer`必须在`MetadataExtractor`对象的整个生命周期内保持不变。如果模型元数据的 Flatbuffers 文件标识符与元数据解析器的标识符不匹配，初始化可能会失败。有关详细信息，请参阅[元数据版本控制](#metadata-versioning)。
+*注：自动生成的架构是一种尽力而为的架构，仅会尝试推断数据的基本属性。用户应根据需要对其进行检查和修改。*
 
-有了匹配的文件标识符，由于 Flatbuffers 的向前和向后兼容机制，元数据提取器将成功读取从所有过去和未来模式生成的元数据。但是，旧的元数据提取器无法提取未来模式中的字段。[最低必需的元数据解析器版本](#the-minimum-necessary-metadata-parser-version)表示可以完整读取元数据 Flatbuffers 的最低元数据解析器版本。您可以使用以下方法来验证是否满足最低必要的解析器版本条件：
+### 训练-应用偏差检测<a name="skewdetect"></a>
 
-```java
-public final boolean isMinimumParserVersionSatisfied();
-```
+#### 概述
 
-允许传入没有元数据的模型。但是，调用从元数据中读取的方法会导致运行时错误。您可以通过调用`hasMetadata`方法检查模型是否具有元数据：
+TensorFlow Data Validation 可以检测训练数据和应用数据之间的分布偏差。当训练数据的特征值分布与应用数据的特征值分布明显不同时，会发生分布偏差。分布偏差的主要原因之一是使用完全不同的语料库来训练数据生成，以克服所需语料库中缺少初始数据的问题。另一个原因是错误的采样机制，即只选择了应用数据的子样本来进行训练。
 
-```java
-public boolean hasMetadata();
-```
+##### 示例场景
 
-`MetadataExtractor`为您提供了方便的函数来获取输入/输出张量的元数据。例如，
+注：例如，为了补偿代表性不足的数据切片，如果使用有偏采样而未适当地对下采样的样本进行向上加权，则训练数据与应用数据之间的特征值分布会发生人为偏差。
 
-```java
-public int getInputTensorCount();
-public TensorMetadata getInputTensorMetadata(int inputIndex);
-public QuantizationParams getInputTensorQuantizationParams(int inputIndex);
-public int[] getInputTensorShape(int inputIndex);
-public int getoutputTensorCount();
-public TensorMetadata getoutputTensorMetadata(int inputIndex);
-public QuantizationParams getoutputTensorQuantizationParams(int inputIndex);
-public int[] getoutputTensorShape(int inputIndex);
-```
+请参阅 [TensorFlow Data Validation 入门指南](https://www.tensorflow.org/tfx/data_validation/get_started#checking_data_skew_and_drift)，了解有关配置训练-应用偏差检测的信息。
 
-尽管[TensorFlow Lite 模型架构](https://github.com/tensorflow/tensorflow/blob/aa7ff6aa28977826e7acae379e82da22482b2bf2/tensorflow/lite/schema/schema.fbs#L1075)支持多个子图，但 TFLite 解释器目前仅支持单个子图。因此， `MetadataExtractor`在其方法中省略了子图索引作为输入参数。
+### 漂移检测
 
-## 从模型中读取关联文件
+支持在数据的连续跨度之间（即跨度 N 和跨度 N+1 之间）进行漂移检测（例如训练数据的不同天数之间）。对于分类特征，我们用[切比雪夫距离](https://en.wikipedia.org/wiki/Chebyshev_distance)表示漂移；对于数值特征，我们用近似 [JS 散度](https://en.wikipedia.org/wiki/Jensen%E2%80%93Shannon_divergence)表示漂移。您可以设置阈值距离，以便在漂移高于可接受范围时收到警告。设置正确的距离通常是一个迭代过程，需要领域知识和实验。
 
-带有元数据和关联文件的 TensorFlow Lite 模型本质上是一个 zip 文件，可以使用常用的 zip 工具解压以获取关联文件。比如可以解压[mobilenet_v1_0.75_160_quantized](https://tfhub.dev/tensorflow/lite-model/mobilenet_v1_0.75_160_quantized/1/metadata/1) ，提取模型中的label文件，如下：
+请参阅 [TensorFlow Data Validation 入门指南](https://www.tensorflow.org/tfx/data_validation/get_started#checking_data_skew_and_drift)，了解有关配置漂移检测的信息。
 
-```sh
-$ unzip mobilenet_v1_0.75_160_quantized_1_metadata_1.tflite
-Archive:  mobilenet_v1_0.75_160_quantized_1_metadata_1.tflite
- extracting: labels.txt
-```
+## 使用可视化检查数据
 
-您还可以通过元数据提取器库读取关联文件。
+TensorFlow Data Validation 提供了用于可视化特征值分布的工具。通过使用 [Facets](https://pair-code.github.io/facets/) 在 Jupyter 笔记本中检查这些分布，您可以发现数据的常见问题。
 
-在 Java 中，将文件名传递给`MetadataExtractor.getAssociatedFile`方法：
+![特征统计信息](https://github.com/tensorflow/docs-l10n/blob/master/site/zh-cn/tfx/guide/images/feature_stats.png?raw=true)
 
-```java
-public InputStream getAssociatedFile(String fileName);
-```
+### 确定可疑的分布
 
-同样，在 C++ 中，这可以通过方法`ModelMetadataExtractor::GetAssociatedFile` ：
+您可以使用 Facets Overview 显示来确定数据中的常见错误，以查找特征值的可疑分布。
 
-```c++
-tflite::support::StatusOr<absl::string_view> GetAssociatedFile(
-      const std::string& filename) const;
-```
+#### 不平衡数据
+
+不平衡特征是一种一个值占主导地位的特征。不平衡特征可以自然发生，但如果特征始终具有相同的值，则可能存在数据错误。要在 Facets Overview 中检测不平衡特征，请从“Sort by”下拉列表中选择“Non-uniformity”。
+
+最不平衡的特征将在每个特征类型列表的顶部列出。例如，以下屏幕截图在“Numeric Features”列表的顶部显示了一个全为零的特征，以及另一个高度不平衡的特征：
+
+![不平衡数据的呈现](https://github.com/tensorflow/docs-l10n/blob/master/site/en-snapshot/tfx/guide/images/uniform.png?raw=true)
+
+#### 均匀分布的数据
+
+均匀分布的特征是一种所有可能的值都以接近相同的频率出现的特征。与不平衡数据一样，这种分布可以自然发生，但也可能由数据错误引起。
+
+要在 Facets Overview 中检测均匀分布的特征，请从“Sort by”下拉列表中选择“Non-uniformity”，然后选中“Reverse order”复选框：
+
+![均匀数据直方图](https://github.com/tensorflow/docs-l10n/blob/master/site/en-snapshot/tfx/guide/images/uniform_cumulative.png?raw=true)
+
+如果唯一值不超过 20 个，则使用条形图表示字符串数据；如果唯一值超过 20 个，则使用累积分布图表示字符串数据。因此，对于字符串数据，均匀分布可能会显示为像上方一样的条形图，也可能显示为像下方一样的直线：
+
+![折线图：均匀数据的累积分布](images/uniform_cumulative.png)
+
+##### 可以产生均匀分布数据的错误
+
+下面列出了一些可以产生均匀分布数据的常见错误：
+
+- 使用字符串表示日期等非字符串数据类型。例如，对于日期时间特征，您将具有许多唯一值，其表示形式为“2017-03-01-11-45-03”。这些唯一值将均匀分布。
+
+- 包含诸如“行号”之类的索引作为特征。这里同样有许多唯一值。
+
+#### 缺失数据
+
+要检查某个特征是否完全缺失值，请执行以下操作：
+
+1. 从“Sort by”下拉列表中选择“Amount missing/zero”。
+2. 选中“Reverse order”复选框。
+3. 查看“missing”列，以了解特征存在缺失值的实例的百分比。
+
+数据错误也可能导致特征值不完整。例如，您可能预期某个特征的值列表始终具有三个元素，但发现有时它只有一个元素。要检查不完整的值或特征值列表没有预期数量的元素的其他情况，请执行以下操作：
+
+1. 从右侧的“Chart to show”下拉菜单中选择“Value list length”。
+
+2. 查看每个特征行右侧的图表。此图表显示了特征的值列表长度范围。例如，下方屏幕截图中突出显示的行显示了具有一些零长度值列表的特征：
+
+![Facets Overview 用零长度的特征值列表显示特征](images/zero_length.png)
+
+#### 特征之间的尺度差异较大
+
+如果您的特征在尺度上差异很大，模型可能难以学习。例如，如果某些特征的范围是 0 到 1，而其他特征的范围是 0 到 1,000,000,000，则尺度上会存在较大的差异。比较各个特征的“max”和“min”列，以找到大幅变化的尺度。
+
+考虑归一化特征值以减少这些较大的差异。
+
+#### 带无效标签的标签
+
+TensorFlow 的 Estimator 对它们作为标签接受的数据类型存在限制。例如，二元分类器通常仅与 {0, 1} 标签一起使用。
+
+在 Facets Overview 中查看标签值，并确保它们符合 [Estimator 的要求](https://github.com/tensorflow/docs/blob/master/site/en/r1/guide/feature_columns.md)。
